@@ -1,36 +1,14 @@
 name: Listenva Document Processor
 
-# This workflow replaces the "Cloudflare Worker pings InfinityFree every few
-# minutes" idea from the original architecture. It calls the EXACT SAME,
-# already-deployed, already-working cron/process.php endpoint — nothing about
-# that PHP code changes. The only thing that changes is HOW OFTEN and HOW
-# PERSISTENTLY it gets called: instead of one call every few minutes from a
-# tiny Cloudflare Worker (which has a hard 10ms CPU budget on the free plan,
-# nowhere near enough to even wait for a response), GitHub Actions can run a
-# normal script for a long time, so it just calls the endpoint over and over,
-# with short pauses, for up to ~25 minutes per run — turning "one bounded
-# step every few minutes" into "dozens of bounded steps, back to back."
-#
-# Each individual call to cron/process.php is still just as bounded and safe
-# as it always was (same 45-60s-per-step reality we already measured) — this
-# workflow just stops leaving 5-10 minutes of silence between those calls.
-
 on:
   schedule:
-    # Every 10 minutes — GitHub's practical minimum for scheduled workflows.
-    # This is just the SAFETY NET that makes sure processing eventually
-    # resumes even if a previous run somehow stopped early; the real
-    # throughput comes from the loop below running for ~25 minutes each time.
     - cron: '*/10 * * * *'
   workflow_dispatch: {}
-    # Lets you manually click "Run workflow" in the GitHub Actions tab,
-    # useful for testing without waiting for the schedule.
 
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # hard ceiling — GitHub will kill the job if it
-                           # somehow runs past this, as a safety backstop
+    timeout-minutes: 30
     steps:
       - name: Process pending Listenva documents
         env:
@@ -38,12 +16,24 @@ jobs:
           CRON_SECRET: ${{ secrets.LISTENVA_CRON_SECRET }}
         run: |
           set -u
+
+          echo "=== Diagnostic: basic outbound connectivity from this runner ==="
+          curl -s -o /dev/null -w "google.com -> HTTP %{http_code}, %{time_total}s\n" --max-time 15 https://www.google.com || echo "google.com: curl failed"
+          echo "--- verbose attempt to reach listenva.site.je ---"
+          curl -sv --max-time 15 "https://listenva.site.je/" 2>&1 | tail -40
+          echo "=== End diagnostic ==="
+          echo ""
+
           echo "Starting Listenva processing loop..."
-          END_TIME=$((SECONDS + 25*60))   # stop with 5 min to spare under the 30-min job timeout
+          END_TIME=$((SECONDS + 25*60))
           CONSECUTIVE_EMPTY=0
 
           while [ "$SECONDS" -lt "$END_TIME" ]; do
-            RESPONSE=$(curl -s --max-time 90 "${CRON_URL}?key=${CRON_SECRET}") || RESPONSE="(curl failed — network or host error)"
+            RESPONSE=$(curl -s --max-time 90 "${CRON_URL}?key=${CRON_SECRET}" 2>&1)
+            CURL_EXIT=$?
+            if [ $CURL_EXIT -ne 0 ]; then
+              RESPONSE="(curl exit code ${CURL_EXIT}: ${RESPONSE})"
+            fi
             echo "$RESPONSE"
 
             if echo "$RESPONSE" | grep -q "Nothing to process"; then
